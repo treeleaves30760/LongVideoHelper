@@ -1,6 +1,7 @@
-def main():
-    print("Hello from longvideohelper!")
+"""Entry point for LongVideoHelper CLI."""
+
+from longvideohelper.main import cli
 
 
 if __name__ == "__main__":
-    main()
+    cli()
