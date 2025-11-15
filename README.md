@@ -115,9 +115,10 @@ transcriber.save_transcription(merged, "output/transcript.txt")
 
 ## Output Format
 
-The tool generates two files:
+The tool generates three transcript files:
 1. `{video_name}_transcript.txt`: Full transcript with timestamps
 2. `{video_name}_transcript_plain.txt`: Plain text transcript without timestamps
+3. `{video_name}_transcript.srt`: SRT subtitle file for video editing
 
 Example transcript with timestamps:
 ```
@@ -125,3 +126,18 @@ Example transcript with timestamps:
 [5.23 - 12.45] Today we'll be discussing Python programming.
 ...
 ```
+
+Example SRT format:
+```
+1
+00:00:00,000 --> 00:00:05,230
+Welcome to this video tutorial.
+
+2
+00:00:05,230 --> 00:00:12,450
+Today we'll be discussing Python programming.
+
+...
+```
+
+The SRT file can be directly imported into video editing software like Adobe Premiere Pro, DaVinci Resolve, Final Cut Pro, or subtitle editors like Subtitle Edit and Aegisub.

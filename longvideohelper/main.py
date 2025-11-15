@@ -129,6 +129,10 @@ def transcribe(video_path, output_dir, model, language, max_clip_duration, keep_
     plain_text_path = output_dir / f"{video_path.stem}_transcript_plain.txt"
     transcriber.save_transcription(merged, plain_text_path, include_timestamps=False)
 
+    # Save SRT subtitle file
+    srt_path = output_dir / f"{video_path.stem}_transcript.srt"
+    transcriber.save_transcription_srt(merged, srt_path)
+
     # Clean up intermediate files if requested
     if not keep_clips:
         click.echo("\nCleaning up intermediate files...")
@@ -144,6 +148,7 @@ def transcribe(video_path, output_dir, model, language, max_clip_duration, keep_
     click.echo(f"\nResults saved to:")
     click.echo(f"  - Transcript (with timestamps): {transcript_path}")
     click.echo(f"  - Transcript (plain text): {plain_text_path}")
+    click.echo(f"  - SRT subtitle file: {srt_path}")
     click.echo(f"\nDetected language: {merged['language']}")
     click.echo(f"Total segments: {len(merged['segments'])}")
     click.echo(f"Total clips processed: {len(clips)}\n")
@@ -207,6 +212,9 @@ def transcribe_audio(audio_path, output_dir, model, language):
     plain_text_path = output_dir / f"{audio_path.stem}_transcript_plain.txt"
     transcriber.save_transcription(result, plain_text_path, include_timestamps=False)
 
+    srt_path = output_dir / f"{audio_path.stem}_transcript.srt"
+    transcriber.save_transcription_srt(result, srt_path)
+
     # Print summary
     click.echo(f"\n{'='*60}")
     click.echo("Transcription Complete!")
@@ -214,6 +222,7 @@ def transcribe_audio(audio_path, output_dir, model, language):
     click.echo(f"\nResults saved to:")
     click.echo(f"  - Transcript (with timestamps): {transcript_path}")
     click.echo(f"  - Transcript (plain text): {plain_text_path}")
+    click.echo(f"  - SRT subtitle file: {srt_path}")
     click.echo(f"\nDetected language: {result.get('language', 'unknown')}")
     click.echo(f"Total segments: {len(result.get('segments', []))}\n")
 
@@ -524,6 +533,10 @@ def process(video_path, output_dir, whisper_model, vlm_provider, vlm_model, api_
     transcript_path = output_dir / f"{video_path.stem}_transcript.txt"
     transcriber.save_transcription(merged, transcript_path, include_timestamps=True)
 
+    # Save SRT subtitle file
+    srt_path = output_dir / f"{video_path.stem}_transcript.srt"
+    transcriber.save_transcription_srt(merged, srt_path)
+
     # Clean up
     for clip_path, _, _ in clips:
         clip_path.unlink(missing_ok=True)
@@ -577,6 +590,7 @@ def process(video_path, output_dir, whisper_model, vlm_provider, vlm_model, api_
     click.echo(f"{'='*60}")
     click.echo(f"\nAll results saved to: {output_dir}/")
     click.echo(f"  - Transcript: {transcript_path}")
+    click.echo(f"  - SRT Subtitle: {srt_path}")
     click.echo(f"  - Chapter Summary: {markdown_path}")
     click.echo(f"  - JSON Data: {json_path}")
     click.echo(f"\nTotal chapters: {len(results)}\n")

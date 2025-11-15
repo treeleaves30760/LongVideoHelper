@@ -176,3 +176,54 @@ class Transcriber:
                 f.write(transcription['text'])
 
         print(f"Transcription saved to: {output_path}")
+
+    def save_transcription_srt(
+        self,
+        transcription: Dict,
+        output_path: Union[str, Path]
+    ):
+        """
+        Save transcription in SRT (SubRip) format for video editing.
+
+        Args:
+            transcription: Transcription result dictionary with segments
+            output_path: Path to save the SRT file
+        """
+        output_path = Path(output_path)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+
+        with open(output_path, 'w', encoding='utf-8') as f:
+            if 'segments' in transcription:
+                for i, segment in enumerate(transcription['segments'], start=1):
+                    start = segment.get('start', 0)
+                    end = segment.get('end', 0)
+                    text = segment.get('text', '').strip()
+
+                    # Convert seconds to SRT timestamp format (HH:MM:SS,mmm)
+                    start_time = self._seconds_to_srt_time(start)
+                    end_time = self._seconds_to_srt_time(end)
+
+                    # Write SRT entry
+                    f.write(f"{i}\n")
+                    f.write(f"{start_time} --> {end_time}\n")
+                    f.write(f"{text}\n\n")
+
+        print(f"SRT file saved to: {output_path}")
+
+    @staticmethod
+    def _seconds_to_srt_time(seconds: float) -> str:
+        """
+        Convert seconds to SRT timestamp format (HH:MM:SS,mmm).
+
+        Args:
+            seconds: Time in seconds
+
+        Returns:
+            Formatted timestamp string
+        """
+        hours = int(seconds // 3600)
+        minutes = int((seconds % 3600) // 60)
+        secs = int(seconds % 60)
+        milliseconds = int((seconds % 1) * 1000)
+
+        return f"{hours:02d}:{minutes:02d}:{secs:02d},{milliseconds:03d}"
