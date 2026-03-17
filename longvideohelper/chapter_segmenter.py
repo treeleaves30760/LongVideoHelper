@@ -4,6 +4,7 @@ This module provides lightweight LLM-based chapter segmentation that integrates
 directly with the transcription pipeline via litellm (same backend as correction).
 """
 
+import csv
 import json
 import logging
 import re
@@ -135,11 +136,13 @@ class ChapterSegmenter:
 2. 標題簡潔（5-15 字），能讓人快速了解該段主要內容
 3. 摘要用一到兩句話描述該章節的重點
 4. 確保章節連續覆蓋整個影片，不要有遺漏的時間段
+5. 為每個章節標記精彩程度 highlight（1-5，5最精彩如Boss戰、搞笑時刻）
+6. 為每個章節標記內容標籤 tags，從以下選擇：戰鬥、Boss戰、探索、建造、搞笑、日常、教學、劇情
 
 **語言：請全程使用繁體中文（zh-TW）輸出。**
 
 **請只輸出以下 JSON 格式，不要輸出任何其他文字：**
-{{"chapters": [{{"start": "0:00", "title": "章節標題", "summary": "該章節摘要"}}]}}"""
+{{"chapters": [{{"start": "0:00", "title": "章節標題", "summary": "該章節摘要", "highlight": 3, "tags": ["戰鬥"]}}]}}"""
 
     def _call_llm(self, prompt: str) -> str:
         """Call LLM via litellm."""
@@ -195,11 +198,18 @@ class ChapterSegmenter:
             start_time = self._parse_ts(start_str)
             title = str(ch.get('title', f'段落 {i + 1}')).strip()
             summary = str(ch.get('summary', '')).strip()
+            highlight = ch.get('highlight', 3)
+            highlight = max(1, min(5, int(highlight) if isinstance(highlight, (int, float)) else 3))
+            tags = ch.get('tags', [])
+            if not isinstance(tags, list):
+                tags = []
             chapters.append({
                 'index': i + 1,
                 'start_time': start_time,
                 'title': title,
                 'summary': summary,
+                'highlight': highlight,
+                'tags': tags,
             })
 
         # Sort by start time
@@ -253,6 +263,10 @@ class ChapterSegmenter:
                 if ch.get('summary'):
                     prev_summary = merged[-1].get('summary', '')
                     merged[-1]['summary'] = f"{prev_summary}；{ch['summary']}" if prev_summary else ch['summary']
+                merged[-1]['highlight'] = max(merged[-1].get('highlight', 3), ch.get('highlight', 3))
+                for tag in ch.get('tags', []):
+                    if tag not in merged[-1].get('tags', []):
+                        merged[-1].setdefault('tags', []).append(tag)
             else:
                 merged.append(ch)
 
@@ -290,11 +304,13 @@ class ChapterSegmenter:
 1. start 使用逐字稿中最接近的時間戳記（注意：時間戳是影片的絕對時間）
 2. 標題簡潔（5-15 字），能讓人快速了解該段主要內容
 3. 摘要用一到兩句話描述該章節的重點
+4. 為每個章節標記精彩程度 highlight（1-5，5最精彩如Boss戰、搞笑時刻）
+5. 為每個章節標記內容標籤 tags，從以下選擇：戰鬥、Boss戰、探索、建造、搞笑、日常、教學、劇情
 
 **語言：請全程使用繁體中文（zh-TW）輸出。**
 
 **請只輸出以下 JSON 格式，不要輸出任何其他文字：**
-{{"chapters": [{{"start": "0:00", "title": "章節標題", "summary": "該章節摘要"}}]}}"""
+{{"chapters": [{{"start": "0:00", "title": "章節標題", "summary": "該章節摘要", "highlight": 3, "tags": ["戰鬥"]}}]}}"""
 
     def _detect_chunked(
         self, segments: List[Dict], total_duration: float
@@ -410,6 +426,8 @@ class ChapterSegmenter:
                 'end_time': end,
                 'title': f'段落 {i + 1}',
                 'summary': '',
+                'highlight': 3,
+                'tags': [],
                 'transcript_segments': ch_segments,
             })
         return chapters
@@ -424,12 +442,20 @@ class ChapterSegmenter:
         """
         if len(sub_chapters) <= 4:
             # Too few sub-chapters to group meaningfully
+            highlight = max((sc.get('highlight', 3) for sc in sub_chapters), default=3)
+            all_tags = []
+            for sc in sub_chapters:
+                for tag in sc.get('tags', []):
+                    if tag not in all_tags:
+                        all_tags.append(tag)
             return [{
                 'index': 1,
                 'title': sub_chapters[0]['title'] if sub_chapters else '全部內容',
                 'start_time': sub_chapters[0]['start_time'] if sub_chapters else 0,
                 'end_time': total_duration,
                 'summary': '',
+                'highlight': highlight,
+                'tags': all_tags,
                 'sub_chapters': sub_chapters,
             }]
 
@@ -438,7 +464,8 @@ class ChapterSegmenter:
         for ch in sub_chapters:
             ts = self._format_ts(ch['start_time'])
             dur = (ch['end_time'] - ch['start_time']) / 60
-            lines.append(f"{ch['index']}. [{ts}] ({dur:.0f}m) {ch['title']} — {ch.get('summary', '')}")
+            stars = '★' * ch.get('highlight', 3) + '☆' * (5 - ch.get('highlight', 3))
+            lines.append(f"{ch['index']}. [{ts}] ({dur:.0f}m) {stars} {ch['title']} — {ch.get('summary', '')}")
         chapter_list = '\n'.join(lines)
 
         num_major = max(2, min(8, len(sub_chapters) // 4))
@@ -469,12 +496,28 @@ class ChapterSegmenter:
 
         try:
             response = self._call_llm(prompt)
-            groups = self._parse_groups_response(response, sub_chapters, total_duration)
-            return groups
+            major_chapters = self._parse_groups_response(response, sub_chapters, total_duration)
         except Exception as e:
             logger.warning(f"Chapter grouping failed: {e}")
             print(f"  Grouping failed ({e}), using flat structure")
-            return self._fallback_grouping(sub_chapters, total_duration)
+            major_chapters = self._fallback_grouping(sub_chapters, total_duration)
+
+        # Aggregate highlight/tags from sub-chapters
+        for mc in major_chapters:
+            subs = mc.get('sub_chapters', [])
+            if subs:
+                mc['highlight'] = max(sc.get('highlight', 3) for sc in subs)
+                all_tags = []
+                for sc in subs:
+                    for tag in sc.get('tags', []):
+                        if tag not in all_tags:
+                            all_tags.append(tag)
+                mc['tags'] = all_tags
+            else:
+                mc['highlight'] = 3
+                mc['tags'] = []
+
+        return major_chapters
 
     def _parse_groups_response(
         self, response: str, sub_chapters: List[Dict], total_duration: float
@@ -622,12 +665,20 @@ class ChapterSegmenter:
             print(f"Grouping into major chapters...")
             major_chapters = self._group_chapters(sub_chapters, total_duration)
         else:
+            highlight = max((sc.get('highlight', 3) for sc in sub_chapters), default=3)
+            all_tags = []
+            for sc in sub_chapters:
+                for tag in sc.get('tags', []):
+                    if tag not in all_tags:
+                        all_tags.append(tag)
             major_chapters = [{
                 'index': 1,
                 'title': '全部內容',
                 'start_time': sub_chapters[0]['start_time'] if sub_chapters else 0,
                 'end_time': total_duration,
                 'summary': '',
+                'highlight': highlight,
+                'tags': all_tags,
                 'sub_chapters': sub_chapters,
             }]
 
@@ -637,16 +688,18 @@ class ChapterSegmenter:
         print(f"{'='*50}")
         for mc in major_chapters:
             dur = (mc['end_time'] - mc['start_time']) / 60
+            mc_stars = '★' * mc.get('highlight', 3) + '☆' * (5 - mc.get('highlight', 3))
             print(
-                f"\n{mc['index']}. {mc['title']} "
+                f"\n{mc['index']}. {mc_stars} {mc['title']} "
                 f"[{self._format_ts(mc['start_time'])} - {self._format_ts(mc['end_time'])}] "
                 f"({dur:.0f}m)"
             )
             for sc in mc['sub_chapters']:
                 dur_sc = (sc['end_time'] - sc['start_time']) / 60
+                sc_stars = '★' * sc.get('highlight', 3) + '☆' * (5 - sc.get('highlight', 3))
                 print(
                     f"   {sc['index']:2d}. [{self._format_ts(sc['start_time'])}] "
-                    f"({dur_sc:.0f}m) {sc['title']}"
+                    f"({dur_sc:.0f}m) {sc_stars} {sc['title']}"
                 )
 
         return major_chapters
@@ -688,10 +741,14 @@ class ChapterSegmenter:
         lines.append("")
         for mc in major_chapters:
             dur = (mc['end_time'] - mc['start_time']) / 60
-            lines.append(f"# {mc['title']} ({dur:.0f}m)")
+            mc_stars = '★' * mc.get('highlight', 3) + '☆' * (5 - mc.get('highlight', 3))
+            lines.append(f"# {mc_stars} {mc['title']} ({dur:.0f}m)")
             for sc in mc.get('sub_chapters', []):
                 ts = _tsp(sc['start_time'])
-                lines.append(f"{ts} {sc['title']}")
+                sc_stars = '★' * sc.get('highlight', 3) + '☆' * (5 - sc.get('highlight', 3))
+                tag_str = ' '.join(f"#{t}" for t in sc.get('tags', []))
+                suffix = f" {tag_str}" if tag_str else ""
+                lines.append(f"{ts} {sc_stars} {sc['title']}{suffix}")
             lines.append("")
 
         # Detailed chapter info
@@ -699,18 +756,26 @@ class ChapterSegmenter:
         lines.append("")
         for mc in major_chapters:
             dur = (mc['end_time'] - mc['start_time']) / 60
-            lines.append(f"### {mc['index']}. {mc['title']}")
+            mc_stars = '★' * mc.get('highlight', 3) + '☆' * (5 - mc.get('highlight', 3))
+            lines.append(f"### {mc['index']}. {mc_stars} {mc['title']}")
             lines.append(f"時間：{_ts(mc['start_time'])} - {_ts(mc['end_time'])} ({dur:.0f} 分鐘)")
             if mc.get('summary'):
                 lines.append(f"摘要：{mc['summary']}")
+            mc_tags = mc.get('tags', [])
+            if mc_tags:
+                lines.append(f"標籤：{' '.join(f'#{t}' for t in mc_tags)}")
             lines.append("")
 
             for sc in mc.get('sub_chapters', []):
                 sc_dur = (sc['end_time'] - sc['start_time']) / 60
-                lines.append(f"#### {mc['index']}.{sc['index']}. {sc['title']}")
+                sc_stars = '★' * sc.get('highlight', 3) + '☆' * (5 - sc.get('highlight', 3))
+                lines.append(f"#### {mc['index']}.{sc['index']}. {sc_stars} {sc['title']}")
                 lines.append(f"時間：{_ts(sc['start_time'])} - {_ts(sc['end_time'])} ({sc_dur:.0f} 分鐘)")
                 if sc.get('summary'):
                     lines.append(f"摘要：{sc['summary']}")
+                sc_tags = sc.get('tags', [])
+                if sc_tags:
+                    lines.append(f"標籤：{' '.join(f'#{t}' for t in sc_tags)}")
                 lines.append("")
 
         with open(output_path, 'w', encoding='utf-8') as f:
@@ -742,6 +807,8 @@ class ChapterSegmenter:
                     'index': mc['index'],
                     'title': mc['title'],
                     'summary': mc.get('summary', ''),
+                    'highlight': mc.get('highlight', 3),
+                    'tags': mc.get('tags', []),
                     'start_time': mc['start_time'],
                     'end_time': mc['end_time'],
                     'start_formatted': _ts(mc['start_time']),
@@ -751,6 +818,8 @@ class ChapterSegmenter:
                             'index': sc['index'],
                             'title': sc['title'],
                             'summary': sc.get('summary', ''),
+                            'highlight': sc.get('highlight', 3),
+                            'tags': sc.get('tags', []),
                             'start_time': sc['start_time'],
                             'end_time': sc['end_time'],
                             'start_formatted': _ts(sc['start_time']),
@@ -767,3 +836,104 @@ class ChapterSegmenter:
             json.dump(data, f, ensure_ascii=False, indent=2)
 
         print(f"Chapters JSON saved to: {output_path}")
+
+    @staticmethod
+    def _format_tc(seconds: float, fps: int = 24) -> str:
+        """Format seconds as HH:MM:SS:FF (frame-based timecode)."""
+        h = int(seconds // 3600)
+        m = int((seconds % 3600) // 60)
+        s = int(seconds % 60)
+        f = int((seconds % 1) * fps)
+        return f"{h:02d}:{m:02d}:{s:02d}:{f:02d}"
+
+    @staticmethod
+    def save_chapters_csv(
+        major_chapters: List[Dict],
+        output_path,
+        video_name: str = "",
+        total_duration: float = 0,
+        fps: int = 24,
+    ):
+        """Save chapters as DaVinci Resolve marker CSV."""
+        output_path = Path(output_path)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        _tc = ChapterSegmenter._format_tc
+
+        rows = []
+        for mc in major_chapters:
+            color = 'Red' if mc.get('highlight', 3) >= 4 else 'Blue'
+            start_tc = _tc(mc['start_time'], fps)
+            end_tc = _tc(mc['end_time'], fps)
+            dur_tc = _tc(mc['end_time'] - mc['start_time'], fps)
+            rows.append({
+                'Name': f"{mc['index']}. {mc['title']}",
+                'Start TC': start_tc,
+                'End TC': end_tc,
+                'Duration': dur_tc,
+                'Color': color,
+                'Notes': mc.get('summary', ''),
+            })
+            for sc in mc.get('sub_chapters', []):
+                sc_color = 'Red' if sc.get('highlight', 3) >= 4 else 'Green'
+                sc_start = _tc(sc['start_time'], fps)
+                sc_end = _tc(sc['end_time'], fps)
+                sc_dur = _tc(sc['end_time'] - sc['start_time'], fps)
+                tags_str = ', '.join(sc.get('tags', []))
+                notes = sc.get('summary', '')
+                if tags_str:
+                    notes = f"[{tags_str}] {notes}" if notes else f"[{tags_str}]"
+                rows.append({
+                    'Name': f"  {mc['index']}.{sc['index']} {sc['title']}",
+                    'Start TC': sc_start,
+                    'End TC': sc_end,
+                    'Duration': sc_dur,
+                    'Color': sc_color,
+                    'Notes': notes,
+                })
+
+        with open(output_path, 'w', encoding='utf-8-sig', newline='') as f:
+            writer = csv.DictWriter(f, fieldnames=['Name', 'Start TC', 'End TC', 'Duration', 'Color', 'Notes'])
+            writer.writeheader()
+            writer.writerows(rows)
+
+        print(f"Chapters CSV saved to: {output_path}")
+
+    @staticmethod
+    def save_chapters_edl(
+        major_chapters: List[Dict],
+        output_path,
+        video_name: str = "",
+        total_duration: float = 0,
+        fps: int = 24,
+    ):
+        """Save chapters as CMX 3600 EDL for NLE import."""
+        output_path = Path(output_path)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        _tc = ChapterSegmenter._format_tc
+
+        lines = []
+        lines.append(f"TITLE: {video_name or 'Untitled'}")
+        lines.append("FCM: NON-DROP FRAME")
+        lines.append("")
+
+        event_num = 1
+        for mc in major_chapters:
+            for sc in mc.get('sub_chapters', []):
+                src_in = _tc(sc['start_time'], fps)
+                src_out = _tc(sc['end_time'], fps)
+                rec_in = _tc(sc['start_time'], fps)
+                rec_out = _tc(sc['end_time'], fps)
+                lines.append(
+                    f"{event_num:03d}  AX       V     C        "
+                    f"{src_in} {src_out} {rec_in} {rec_out}"
+                )
+                lines.append(f"* FROM CLIP NAME: {sc['title']}")
+                if sc.get('summary'):
+                    lines.append(f"* COMMENT: {sc['summary']}")
+                lines.append("")
+                event_num += 1
+
+        with open(output_path, 'w', encoding='utf-8') as f:
+            f.write('\n'.join(lines))
+
+        print(f"Chapters EDL saved to: {output_path}")

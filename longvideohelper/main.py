@@ -22,10 +22,34 @@ from .utils import parse_transcript_file, get_video_duration
 load_dotenv()
 
 
+def _load_config(config_path=None):
+    """Load configuration from TOML file."""
+    path = Path(config_path) if config_path else Path('longvideohelper.toml')
+    if not path.exists():
+        return {}
+    try:
+        import tomllib
+    except ImportError:
+        try:
+            import tomli as tomllib
+        except ImportError:
+            logging.getLogger(__name__).warning(
+                f"Config file found ({path}) but tomllib/tomli not available. "
+                "Requires Python 3.11+ or 'pip install tomli'."
+            )
+            return {}
+    with open(path, 'rb') as f:
+        config = tomllib.load(f)
+    logging.getLogger(__name__).info(f"Loaded config from: {path}")
+    return config
+
+
 @click.group()
 @click.version_option(version="0.1.0")
 @click.option('-v', '--verbose', is_flag=True, help='Enable verbose (DEBUG) logging')
-def cli(verbose):
+@click.option('--config', type=click.Path(), default=None, help='Config file path (default: longvideohelper.toml in cwd)')
+@click.pass_context
+def cli(ctx, verbose, config):
     """LongVideoHelper - A tool for long video transcription and chapter division."""
     level = logging.DEBUG if verbose else logging.INFO
     logging.basicConfig(
@@ -33,6 +57,8 @@ def cli(verbose):
         format='%(asctime)s [%(levelname)s] %(name)s: %(message)s',
         datefmt='%H:%M:%S',
     )
+    ctx.ensure_object(dict)
+    ctx.obj['config'] = _load_config(config)
 
 
 @cli.command()
@@ -136,19 +162,35 @@ def cli(verbose):
 @click.option(
     '--chapter-duration',
     type=int,
-    default=300,
+    default=None,
     help='Target chapter duration in seconds (default: 300 = 5 minutes)'
 )
-def transcribe(video_path, output_dir, model, language, max_clip_duration, keep_clips,
+@click.option(
+    '--fps',
+    type=int,
+    default=None,
+    help='Frame rate for timecode export (default: 24)'
+)
+@click.pass_context
+def transcribe(ctx, video_path, output_dir, model, language, max_clip_duration, keep_clips,
                initial_prompt, prompt_file, beam_size, compute_type, no_hallucination_filter,
                vocab_file, max_segment_duration, correction_model, max_clips,
-               chapters, chapter_model, chapter_duration):
+               chapters, chapter_model, chapter_duration, fps):
     """
     Transcribe a video file using Whisper.
 
     This command extracts audio from the video, clips it using VAD,
     and transcribes each clip using Whisper.
     """
+    # Resolve config
+    config = ctx.obj.get('config', {})
+    vocab_file = vocab_file or config.get('correction', {}).get('vocab_file')
+    correction_model = correction_model or config.get('correction', {}).get('model')
+    chapter_model = chapter_model or config.get('chapters', {}).get('model')
+    chapter_duration = chapter_duration or config.get('chapters', {}).get('duration', 300)
+    chapters = chapters or config.get('chapters', {}).get('enabled', False)
+    fps = fps or config.get('output', {}).get('fps', 24)
+
     video_path = Path(video_path)
     output_dir = Path(output_dir) / datetime.now().strftime("%Y-%m-%d-%H-%M-%S")
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -287,6 +329,16 @@ def transcribe(video_path, output_dir, model, language, max_clip_duration, keep_
                     chapter_results, chapters_json_path,
                     video_name=video_path.stem, total_duration=video_duration,
                 )
+                chapters_csv_path = output_dir / f"{video_path.stem}_chapters_markers.csv"
+                chapters_edl_path = output_dir / f"{video_path.stem}_chapters.edl"
+                segmenter.save_chapters_csv(
+                    chapter_results, chapters_csv_path,
+                    video_name=video_path.stem, total_duration=video_duration, fps=fps,
+                )
+                segmenter.save_chapters_edl(
+                    chapter_results, chapters_edl_path,
+                    video_name=video_path.stem, total_duration=video_duration, fps=fps,
+                )
 
     # Print summary
     click.echo(f"\n{'='*60}")
@@ -300,6 +352,8 @@ def transcribe(video_path, output_dir, model, language, max_clip_duration, keep_
     if chapter_results:
         click.echo(f"  - Chapters (markdown): {video_path.stem}_chapters.md")
         click.echo(f"  - Chapters (JSON): {video_path.stem}_chapters.json")
+        click.echo(f"  - Chapters (CSV markers): {video_path.stem}_chapters_markers.csv")
+        click.echo(f"  - Chapters (EDL): {video_path.stem}_chapters.edl")
         click.echo(f"  Total chapters: {len(chapter_results)}")
     click.echo(f"\nDetected language: {merged['language']}")
     click.echo(f"Total segments: {len(merged['segments'])}")
@@ -376,7 +430,8 @@ def transcribe(video_path, output_dir, model, language, max_clip_duration, keep_
     default=None,
     help='LLM model for vocab-based correction (e.g. gemini/gemini-2.0-flash, ollama/qwen3.5:27b, transformers/Qwen/Qwen3.5-27B). Requires --vocab-file'
 )
-def transcribe_audio(audio_path, output_dir, model, language,
+@click.pass_context
+def transcribe_audio(ctx, audio_path, output_dir, model, language,
                      initial_prompt, prompt_file, beam_size, compute_type, no_hallucination_filter,
                      vocab_file, max_segment_duration, correction_model):
     """
@@ -385,6 +440,11 @@ def transcribe_audio(audio_path, output_dir, model, language,
     This command transcribes an audio file using Whisper without
     performing VAD-based clipping.
     """
+    # Resolve config
+    config = ctx.obj.get('config', {})
+    vocab_file = vocab_file or config.get('correction', {}).get('vocab_file')
+    correction_model = correction_model or config.get('correction', {}).get('model')
+
     audio_path = Path(audio_path)
     output_dir = Path(output_dir) / datetime.now().strftime("%Y-%m-%d-%H-%M-%S")
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -650,7 +710,7 @@ def create_chapters(video_path, transcript, output_dir, vlm_provider, vlm_model,
 @click.option(
     '--model',
     '-m',
-    required=True,
+    default=None,
     help='LLM model for chapter detection (e.g. gemini/gemini-2.0-flash, ollama/gpt-oss:20b)'
 )
 @click.option(
@@ -670,32 +730,52 @@ def create_chapters(video_path, transcript, output_dir, vlm_provider, vlm_model,
 @click.option(
     '--chapter-duration',
     type=int,
-    default=300,
+    default=None,
     help='Target chapter duration in seconds (default: 300 = 5 minutes)'
 )
 @click.option(
     '--min-chapter-duration',
     type=int,
-    default=120,
+    default=None,
     help='Minimum chapter duration in seconds (default: 120 = 2 minutes)'
 )
 @click.option(
     '--max-chapter-duration',
     type=int,
-    default=900,
+    default=None,
     help='Maximum chapter duration in seconds (default: 900 = 15 minutes)'
 )
-def detect_chapters(transcript_path, model, output_dir, duration,
-                    chapter_duration, min_chapter_duration, max_chapter_duration):
+@click.option(
+    '--fps',
+    type=int,
+    default=None,
+    help='Frame rate for timecode export (default: 24)'
+)
+@click.pass_context
+def detect_chapters(ctx, transcript_path, model, output_dir, duration,
+                    chapter_duration, min_chapter_duration, max_chapter_duration, fps):
     """
     Detect chapter boundaries from an existing transcript file.
 
     Takes a transcript file (with timestamps) and uses an LLM to identify
     logical chapter boundaries. Useful for re-segmenting without re-transcribing.
     """
+    # Resolve config
+    config = ctx.obj.get('config', {})
+    model = model or config.get('chapters', {}).get('model')
+    if not model:
+        click.echo("Error: --model is required (or set [chapters] model in config)", err=True)
+        return
+    fps = fps or config.get('output', {}).get('fps', 24)
+    chapter_duration = chapter_duration or config.get('chapters', {}).get('duration', 300)
+    min_chapter_duration = min_chapter_duration or 120
+    max_chapter_duration = max_chapter_duration or 900
+
     transcript_path = Path(transcript_path)
 
     # Determine output directory
+    if output_dir is None:
+        output_dir = config.get('output', {}).get('dir')
     if output_dir:
         output_dir = Path(output_dir)
     else:
@@ -757,6 +837,17 @@ def detect_chapters(transcript_path, model, output_dir, duration,
         video_name=stem, total_duration=duration,
     )
 
+    chapters_csv_path = output_dir / f"{stem}_chapters_markers.csv"
+    chapters_edl_path = output_dir / f"{stem}_chapters.edl"
+    segmenter.save_chapters_csv(
+        chapter_results, chapters_csv_path,
+        video_name=stem, total_duration=duration, fps=fps,
+    )
+    segmenter.save_chapters_edl(
+        chapter_results, chapters_edl_path,
+        video_name=stem, total_duration=duration, fps=fps,
+    )
+
     # Print summary
     click.echo(f"\n{'='*60}")
     click.echo("Chapter Detection Complete!")
@@ -764,6 +855,8 @@ def detect_chapters(transcript_path, model, output_dir, duration,
     click.echo(f"\nResults saved to:")
     click.echo(f"  - Chapters (markdown): {chapters_md_path}")
     click.echo(f"  - Chapters (JSON): {chapters_json_path}")
+    click.echo(f"  - Chapters (CSV markers): {chapters_csv_path}")
+    click.echo(f"  - Chapters (EDL): {chapters_edl_path}")
     click.echo(f"\nTotal chapters: {len(chapter_results)}\n")
 
 
@@ -1006,6 +1099,55 @@ def process(video_path, output_dir, whisper_model, vlm_provider, vlm_model, api_
     click.echo(f"  - Chapter Summary: {markdown_path}")
     click.echo(f"  - JSON Data: {json_path}")
     click.echo(f"\nTotal chapters: {len(results)}\n")
+
+
+@cli.command()
+@click.option('--output', '-o', type=click.Path(), default='longvideohelper.toml', help='Config file path')
+def init_config(output):
+    """Generate a template configuration file."""
+    output = Path(output)
+    if output.exists():
+        click.echo(f"Config file already exists: {output}")
+        click.echo("Delete it first or use a different path.")
+        return
+
+    template = """# LongVideoHelper Configuration
+# Place this file in your project directory as longvideohelper.toml
+
+[transcription]
+# Whisper model: tiny, base, small, medium, large, turbo
+model = "turbo"
+# Language code (e.g., "zh", "en") or omit for auto-detect
+# language = "zh"
+# Beam search width
+beam_size = 5
+
+[correction]
+# LLM model for vocabulary-based correction
+# model = "ollama/gpt-oss:20b"
+# Path to vocabulary file
+# vocab_file = "vocab_oncehuman.txt"
+
+[chapters]
+# Enable chapter detection after transcription
+enabled = false
+# LLM model for chapter detection
+# model = "ollama/gpt-oss:20b"
+# Target chapter duration in seconds
+duration = 300
+
+[output]
+# Output directory
+dir = "output"
+# Frame rate for timecode export (CSV/EDL)
+fps = 24
+"""
+
+    with open(output, 'w', encoding='utf-8') as f:
+        f.write(template)
+
+    click.echo(f"Config file created: {output}")
+    click.echo("Edit the file to customize your settings.")
 
 
 if __name__ == '__main__':
