@@ -15,5 +15,13 @@ wheels/
 
 # Output files
 output/
+output_*/
 logs/
 *.log
+
+# Audio/video temp files
+*.wav
+*.mp3
+
+# Claude Code local settings
+.claude/

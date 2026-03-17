@@ -1,143 +1,157 @@
 # LongVideoHelper
 
-This project aim to offer a tool that use whisper and VLM for long video chapter dividing.
+A CLI tool for long video transcription with Whisper, featuring OCR-assisted vocabulary correction for game streams and domain-specific content.
 
-## Workflow
+## Features
 
-User input a Video, and we will create the pure audio (mp4). While processing the audio, since the video may up to 3 hours, the clip algorithm is we will first clip the video with webrtcvad, make sure each clip will not cut one sentence, than I want each clip is smaller than 5 minutes because whisper will perform more accuracy in this length. Once we get a clip, we will use the whisper to transcribe.
-
-After whole video finish the transcribe, than we will try to ask VLM to seperate the video into several chapter. Since the transcribe result may not be correct, so we need the aid of the video. First we will send the whole transcript, and ask the VLM to output the detailed chapter start and end time, each chapter should control in 6 minutes. Then for each chapter, we will get the key frames with transcribe, and ask LLM to correct the transcribe while output the summary for this chapter.
-
-We expected output is a full-video transcript and the summary md for each chapter information.
-
-## Technuqie stack
-
-- Whisper turbo
-- VLM:
-  - Cloud: Gemini flash 2.5
-  - Local: Gemma3-4B or Gemma3-12B, Qwen3-VL-8B
-  - LLMInterface: create a llm.py, and use the LiteLLM to allow using cloud or ollama etc.
-- Interface: CLI, ready for GUI(TKinter in future)
-- Use uv.
+- **Whisper transcription** with VAD-based clipping for long videos (1-3+ hours)
+- **Vocabulary-guided correction** using LLM (local or API) with domain-specific term lists
+- **OCR-assisted correction** extracts on-screen text from video frames via PaddleOCR for additional context
+- **Rule-based post-correction** deterministically fixes known transcription errors
+- **SRT subtitle output** for video editing software
+- **Automatic retry** with fallback when Whisper encounters problematic audio segments
 
 ## Installation
 
 This project uses [uv](https://github.com/astral-sh/uv) for Python package management.
 
-1. Clone the repository:
 ```bash
-git clone <repository-url>
+git clone git@github.com:treeleaves30760/LongVideoHelper.git
 cd LongVideoHelper
-```
-
-2. Install dependencies:
-```bash
 uv sync
 ```
 
-3. Ensure you have FFmpeg installed on your system:
-- macOS: `brew install ffmpeg`
-- Ubuntu/Debian: `sudo apt-get install ffmpeg`
-- Windows: Download from [ffmpeg.org](https://ffmpeg.org/download.html)
+### Optional dependencies
+
+```bash
+# For local LLM correction (e.g., Qwen3.5-4B)
+uv sync --extra transformers
+
+# For OCR-assisted correction (PaddleOCR)
+uv sync --extra ocr
+```
+
+### System requirements
+
+- **FFmpeg**: Required for audio extraction
+  - macOS: `brew install ffmpeg`
+  - Ubuntu/Debian: `sudo apt-get install ffmpeg`
+  - Windows: Download from [ffmpeg.org](https://ffmpeg.org/download.html)
+- **GPU**: Recommended for Whisper and local LLM models (NVIDIA CUDA)
 
 ## Usage
 
-### Transcribe a Video
-
-Transcribe a video file using Whisper with automatic VAD-based clipping:
+### Basic transcription
 
 ```bash
-uv run longvideohelper transcribe path/to/video.mp4
+uv run longvideohelper transcribe video.mp4
 ```
 
-Options:
-- `-o, --output-dir PATH`: Output directory for results (default: `output`)
-- `-m, --model MODEL`: Whisper model to use (tiny, base, small, medium, large, turbo; default: turbo)
-- `-l, --language LANG`: Language code (e.g., en, zh) or auto-detect if not specified
-- `--max-clip-duration SECONDS`: Maximum duration of each clip in seconds (default: 300)
-- `--keep-clips`: Keep intermediate audio clips (default: delete after transcription)
+### Transcription with vocabulary correction
 
-Example with options:
-```bash
-uv run longvideohelper transcribe video.mp4 -o results -m turbo -l en --keep-clips
-```
-
-### Transcribe Audio Only
-
-Transcribe an audio file directly without VAD clipping:
+Create a vocabulary file (see [Vocabulary File Format](#vocabulary-file-format)) and specify a correction model:
 
 ```bash
-uv run longvideohelper transcribe-audio path/to/audio.wav
+# Using local model (Qwen3.5-4B, runs on GPU)
+uv run longvideohelper transcribe video.mp4 \
+  -l zh \
+  --vocab-file vocab.txt \
+  --correction-model transformers/Qwen/Qwen3.5-4B
+
+# Using cloud API (Gemini, requires GEMINI_API_KEY)
+uv run longvideohelper transcribe video.mp4 \
+  -l zh \
+  --vocab-file vocab.txt \
+  --correction-model gemini/gemini-2.0-flash
 ```
 
-Options:
-- `-o, --output-dir PATH`: Output directory for results
-- `-m, --model MODEL`: Whisper model to use
-- `-l, --language LANG`: Language code or auto-detect
+### Options
 
-### Using Python API
+| Option | Default | Description |
+|--------|---------|-------------|
+| `-o, --output-dir` | `output` | Output directory (creates timestamped subdirectory) |
+| `-m, --model` | `turbo` | Whisper model (`tiny`, `base`, `small`, `medium`, `large`, `turbo`) |
+| `-l, --language` | auto | Language code (e.g., `zh`, `en`, `ja`) |
+| `--vocab-file` | — | Vocabulary file for hotwords and LLM correction |
+| `--correction-model` | — | LLM model for correction (see examples above) |
+| `--max-clip-duration` | 300 | Max clip length in seconds |
+| `--max-clips` | all | Only process first N clips (for testing) |
+| `--max-segment-duration` | 10 | Max subtitle segment length in seconds |
+| `--keep-clips` | false | Keep intermediate audio clips |
+| `--compute-type` | auto | CTranslate2 quantization (`float16`, `int8`, etc.) |
+| `--no-hallucination-filter` | false | Disable hallucination filtering |
 
-You can also use the modules programmatically:
+### Testing with fewer clips
 
-```python
-from longvideohelper.audio_extractor import AudioExtractor
-from longvideohelper.audio_clipper import AudioClipper
-from longvideohelper.transcriber import Transcriber
+For development and tuning, use `--max-clips` to limit processing:
 
-# Extract audio from video
-extractor = AudioExtractor()
-audio_path = extractor.extract_audio("video.mp4")
-
-# Clip audio using VAD
-clipper = AudioClipper(max_clip_duration=300)
-clips = clipper.clip_audio(audio_path, "output/clips")
-
-# Transcribe clips
-transcriber = Transcriber(model_name="turbo")
-transcriptions = transcriber.transcribe_clips(clips)
-merged = transcriber.merge_transcriptions(transcriptions)
-transcriber.save_transcription(merged, "output/transcript.txt")
+```bash
+# Quick test with first 2 clips (~10 min of video)
+uv run longvideohelper transcribe video.mp4 -l zh \
+  --vocab-file vocab.txt \
+  --correction-model transformers/Qwen/Qwen3.5-4B \
+  --max-clips 2
 ```
 
-## Current Status
+## Vocabulary File Format
 
-✅ **Phase 1: Video to Transcribe (COMPLETED)**
-- Audio extraction from video
-- VAD-based audio clipping
-- Whisper transcription
-- CLI interface
+The vocabulary file supports two types of entries:
 
-🚧 **Phase 2: VLM Chapter Division (TODO)**
-- Chapter detection using VLM
-- Key frame extraction
-- Transcript correction with VLM
-- Chapter summaries
-
-## Output Format
-
-The tool generates three transcript files:
-1. `{video_name}_transcript.txt`: Full transcript with timestamps
-2. `{video_name}_transcript_plain.txt`: Plain text transcript without timestamps
-3. `{video_name}_transcript.srt`: SRT subtitle file for video editing
-
-Example transcript with timestamps:
 ```
-[0.00 - 5.23] Welcome to this video tutorial.
-[5.23 - 12.45] Today we'll be discussing Python programming.
-...
+# Comments start with #
+
+# Terms: used as Whisper hotwords + LLM reference vocabulary
+Once Human
+異常物
+畸變體
+轉能電池
+
+# Known errors: deterministic post-correction rules
+# Format: wrong->correct
+一場物->異常物
+燃燃電池->轉能電池
+葉爵->夜橘
 ```
 
-Example SRT format:
+See `vocab_oncehuman.txt` for a complete example.
+
+## Output
+
+Results are saved to `output/YYYY-MM-DD-HH-MM-SS/` with:
+
+| File | Description |
+|------|-------------|
+| `*_transcript.srt` | Corrected SRT subtitles |
+| `*_raw.srt` | Raw SRT (before LLM correction) |
+| `*_transcript.txt` | Corrected transcript with timestamps |
+| `*_transcript_plain.txt` | Plain text transcript |
+
+The SRT files can be imported into video editors (Premiere Pro, DaVinci Resolve, Final Cut Pro, etc.).
+
+## How Correction Works
+
 ```
-1
-00:00:00,000 --> 00:00:05,230
-Welcome to this video tutorial.
-
-2
-00:00:05,230 --> 00:00:12,450
-Today we'll be discussing Python programming.
-
-...
+Video → Extract Audio → VAD Clip → Whisper Transcribe
+                                         ↓
+                              Raw segments (may have errors)
+                                         ↓
+         Video → Extract Frames (every 10s) → PaddleOCR → Screen text
+                                         ↓
+         Raw segments + OCR text + Vocab → LLM Correction
+                                         ↓
+         Known error→correct rules → Rule-based Post-Correction
+                                         ↓
+                              Final corrected subtitles
 ```
 
-The SRT file can be directly imported into video editing software like Adobe Premiere Pro, DaVinci Resolve, Final Cut Pro, or subtitle editors like Subtitle Edit and Aegisub.
+1. **Whisper** transcribes audio with vocabulary hotwords (top 20 terms)
+2. **PaddleOCR** extracts on-screen text from video frames for additional context
+3. **LLM** corrects domain-specific terms using vocabulary + OCR context
+4. **Rule-based** post-correction applies deterministic `wrong->correct` mappings
+
+## Tech Stack
+
+- **Whisper**: faster-whisper (CTranslate2) — `turbo` = `large-v3-turbo`
+- **OCR**: PaddleOCR (Traditional Chinese)
+- **LLM**: Local via transformers (Qwen3.5-4B) or API via LiteLLM (Gemini, OpenAI, etc.)
+- **Package manager**: uv

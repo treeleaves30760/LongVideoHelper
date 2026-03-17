@@ -1,7 +1,9 @@
 """Main CLI module for LongVideoHelper."""
 
 import click
+import logging
 import os
+from datetime import datetime
 from pathlib import Path
 from dotenv import load_dotenv
 from .audio_extractor import AudioExtractor
@@ -21,9 +23,15 @@ load_dotenv()
 
 @click.group()
 @click.version_option(version="0.1.0")
-def cli():
+@click.option('-v', '--verbose', is_flag=True, help='Enable verbose (DEBUG) logging')
+def cli(verbose):
     """LongVideoHelper - A tool for long video transcription and chapter division."""
-    pass
+    level = logging.DEBUG if verbose else logging.INFO
+    logging.basicConfig(
+        level=level,
+        format='%(asctime)s [%(levelname)s] %(name)s: %(message)s',
+        datefmt='%H:%M:%S',
+    )
 
 
 @cli.command()
@@ -60,7 +68,62 @@ def cli():
     is_flag=True,
     help='Keep intermediate audio clips (default: delete after transcription)'
 )
-def transcribe(video_path, output_dir, model, language, max_clip_duration, keep_clips):
+@click.option(
+    '--initial-prompt',
+    type=str,
+    default=None,
+    help='Initial prompt for Whisper (domain vocabulary, proper nouns, style hints)'
+)
+@click.option(
+    '--prompt-file',
+    type=click.Path(exists=True),
+    default=None,
+    help='Load initial prompt from a text file'
+)
+@click.option(
+    '--beam-size',
+    type=int,
+    default=5,
+    help='Beam search width (default: 5)'
+)
+@click.option(
+    '--compute-type',
+    type=click.Choice(['default', 'float16', 'int8_float16', 'int8', 'float32']),
+    default='default',
+    help='CTranslate2 compute type (default: auto-select)'
+)
+@click.option(
+    '--no-hallucination-filter',
+    is_flag=True,
+    help='Disable hallucination filtering'
+)
+@click.option(
+    '--vocab-file',
+    type=click.Path(exists=True),
+    default=None,
+    help='Vocabulary file with hotwords and known error examples for LLM correction'
+)
+@click.option(
+    '--max-segment-duration',
+    type=int,
+    default=10,
+    help='Max subtitle segment duration in seconds (default: 10)'
+)
+@click.option(
+    '--correction-model',
+    type=str,
+    default=None,
+    help='LLM model for vocab-based correction (e.g. gemini/gemini-2.0-flash, ollama/qwen3.5:27b, transformers/Qwen/Qwen3.5-27B). Requires --vocab-file'
+)
+@click.option(
+    '--max-clips',
+    type=int,
+    default=None,
+    help='Only transcribe the first N clips (for development testing)'
+)
+def transcribe(video_path, output_dir, model, language, max_clip_duration, keep_clips,
+               initial_prompt, prompt_file, beam_size, compute_type, no_hallucination_filter,
+               vocab_file, max_segment_duration, correction_model, max_clips):
     """
     Transcribe a video file using Whisper.
 
@@ -68,7 +131,7 @@ def transcribe(video_path, output_dir, model, language, max_clip_duration, keep_
     and transcribes each clip using Whisper.
     """
     video_path = Path(video_path)
-    output_dir = Path(output_dir)
+    output_dir = Path(output_dir) / datetime.now().strftime("%Y-%m-%d-%H-%M-%S")
     output_dir.mkdir(parents=True, exist_ok=True)
 
     click.echo(f"\n{'='*60}")
@@ -78,7 +141,15 @@ def transcribe(video_path, output_dir, model, language, max_clip_duration, keep_
     click.echo(f"Output Directory: {output_dir}")
     click.echo(f"Whisper Model: {model}")
     click.echo(f"Language: {language or 'auto-detect'}")
-    click.echo(f"Max Clip Duration: {max_clip_duration}s\n")
+    click.echo(f"Max Clip Duration: {max_clip_duration}s")
+
+    # Load prompt from file if specified
+    if prompt_file:
+        with open(prompt_file, 'r', encoding='utf-8') as f:
+            initial_prompt = f.read().strip()
+    if initial_prompt:
+        click.echo(f"Initial Prompt: {initial_prompt[:80]}{'...' if len(initial_prompt) > 80 else ''}")
+    click.echo()
 
     # Step 1: Extract audio
     click.echo("Step 1/4: Extracting audio from video...")
@@ -107,9 +178,23 @@ def transcribe(video_path, output_dir, model, language, max_clip_duration, keep_
 
     click.echo(f"Generated {len(clips)} audio clips")
 
+    if max_clips is not None and max_clips < len(clips):
+        click.echo(f"  (limiting to first {max_clips} clips for testing)")
+        clips = clips[:max_clips]
+
     # Step 3: Transcribe clips
     click.echo("\nStep 3/4: Transcribing audio clips...")
-    transcriber = Transcriber(model_name=model)
+    transcriber = Transcriber(
+        model_name=model,
+        compute_type=compute_type,
+        beam_size=beam_size,
+        initial_prompt=initial_prompt,
+        hallucination_filter=not no_hallucination_filter,
+        vocab_file=vocab_file,
+        max_segment_duration=max_segment_duration,
+        correction_model=correction_model,
+        video_path=str(video_path),
+    )
 
     try:
         transcriptions = transcriber.transcribe_clips(clips, language=language)
@@ -120,6 +205,14 @@ def transcribe(video_path, output_dir, model, language, max_clip_duration, keep_
     # Step 4: Merge and save results
     click.echo("\nStep 4/4: Saving transcription results...")
     merged = transcriber.merge_transcriptions(transcriptions)
+
+    # Save raw (pre-correction) SRT
+    raw_merged = transcriber.merge_transcriptions([
+        {**t, "segments": t.get("raw_segments", t.get("segments", []))}
+        for t in transcriptions
+    ])
+    raw_srt_path = output_dir / f"{video_path.stem}_raw.srt"
+    transcriber.save_transcription_srt(raw_merged, raw_srt_path)
 
     # Save full transcription with timestamps
     transcript_path = output_dir / f"{video_path.stem}_transcript.txt"
@@ -136,19 +229,19 @@ def transcribe(video_path, output_dir, model, language, max_clip_duration, keep_
     # Clean up intermediate files if requested
     if not keep_clips:
         click.echo("\nCleaning up intermediate files...")
-        for clip_path, _, _ in clips:
-            clip_path.unlink(missing_ok=True)
-        clips_dir.rmdir()
+        import shutil
+        shutil.rmtree(clips_dir, ignore_errors=True)
         audio_path.unlink(missing_ok=True)
 
     # Print summary
     click.echo(f"\n{'='*60}")
     click.echo("Transcription Complete!")
     click.echo(f"{'='*60}")
-    click.echo(f"\nResults saved to:")
-    click.echo(f"  - Transcript (with timestamps): {transcript_path}")
-    click.echo(f"  - Transcript (plain text): {plain_text_path}")
-    click.echo(f"  - SRT subtitle file: {srt_path}")
+    click.echo(f"\nResults saved to: {output_dir}")
+    click.echo(f"  - Raw SRT (pre-correction): {raw_srt_path.name}")
+    click.echo(f"  - Transcript (with timestamps): {transcript_path.name}")
+    click.echo(f"  - Transcript (plain text): {plain_text_path.name}")
+    click.echo(f"  - SRT subtitle file: {srt_path.name}")
     click.echo(f"\nDetected language: {merged['language']}")
     click.echo(f"Total segments: {len(merged['segments'])}")
     click.echo(f"Total clips processed: {len(clips)}\n")
@@ -177,7 +270,56 @@ def transcribe(video_path, output_dir, model, language, max_clip_duration, keep_
     default=None,
     help='Language code (e.g., en, zh) or auto-detect if not specified'
 )
-def transcribe_audio(audio_path, output_dir, model, language):
+@click.option(
+    '--initial-prompt',
+    type=str,
+    default=None,
+    help='Initial prompt for Whisper (domain vocabulary, proper nouns, style hints)'
+)
+@click.option(
+    '--prompt-file',
+    type=click.Path(exists=True),
+    default=None,
+    help='Load initial prompt from a text file'
+)
+@click.option(
+    '--beam-size',
+    type=int,
+    default=5,
+    help='Beam search width (default: 5)'
+)
+@click.option(
+    '--compute-type',
+    type=click.Choice(['default', 'float16', 'int8_float16', 'int8', 'float32']),
+    default='default',
+    help='CTranslate2 compute type (default: auto-select)'
+)
+@click.option(
+    '--no-hallucination-filter',
+    is_flag=True,
+    help='Disable hallucination filtering'
+)
+@click.option(
+    '--vocab-file',
+    type=click.Path(exists=True),
+    default=None,
+    help='Vocabulary file with hotwords and known error examples for LLM correction'
+)
+@click.option(
+    '--max-segment-duration',
+    type=int,
+    default=10,
+    help='Max subtitle segment duration in seconds (default: 10)'
+)
+@click.option(
+    '--correction-model',
+    type=str,
+    default=None,
+    help='LLM model for vocab-based correction (e.g. gemini/gemini-2.0-flash, ollama/qwen3.5:27b, transformers/Qwen/Qwen3.5-27B). Requires --vocab-file'
+)
+def transcribe_audio(audio_path, output_dir, model, language,
+                     initial_prompt, prompt_file, beam_size, compute_type, no_hallucination_filter,
+                     vocab_file, max_segment_duration, correction_model):
     """
     Transcribe an audio file directly (without clipping).
 
@@ -185,7 +327,7 @@ def transcribe_audio(audio_path, output_dir, model, language):
     performing VAD-based clipping.
     """
     audio_path = Path(audio_path)
-    output_dir = Path(output_dir)
+    output_dir = Path(output_dir) / datetime.now().strftime("%Y-%m-%d-%H-%M-%S")
     output_dir.mkdir(parents=True, exist_ok=True)
 
     click.echo(f"\n{'='*60}")
@@ -194,16 +336,38 @@ def transcribe_audio(audio_path, output_dir, model, language):
     click.echo(f"Audio: {audio_path}")
     click.echo(f"Output Directory: {output_dir}")
     click.echo(f"Whisper Model: {model}")
-    click.echo(f"Language: {language or 'auto-detect'}\n")
+    click.echo(f"Language: {language or 'auto-detect'}")
+
+    # Load prompt from file if specified
+    if prompt_file:
+        with open(prompt_file, 'r', encoding='utf-8') as f:
+            initial_prompt = f.read().strip()
+    if initial_prompt:
+        click.echo(f"Initial Prompt: {initial_prompt[:80]}{'...' if len(initial_prompt) > 80 else ''}")
+    click.echo()
 
     click.echo("Transcribing audio...")
-    transcriber = Transcriber(model_name=model)
+    transcriber = Transcriber(
+        model_name=model,
+        compute_type=compute_type,
+        beam_size=beam_size,
+        initial_prompt=initial_prompt,
+        hallucination_filter=not no_hallucination_filter,
+        vocab_file=vocab_file,
+        max_segment_duration=max_segment_duration,
+        correction_model=correction_model,
+    )
 
     try:
         result = transcriber.transcribe_clip(audio_path, language=language)
     except Exception as e:
         click.echo(f"Error transcribing audio: {str(e)}", err=True)
         return
+
+    # Save raw (pre-correction) SRT
+    raw_result = {**result, "segments": result.get("raw_segments", result.get("segments", []))}
+    raw_srt_path = output_dir / f"{audio_path.stem}_raw.srt"
+    transcriber.save_transcription_srt(raw_result, raw_srt_path)
 
     # Save results
     transcript_path = output_dir / f"{audio_path.stem}_transcript.txt"
@@ -278,7 +442,7 @@ def create_chapters(video_path, transcript, output_dir, vlm_provider, vlm_model,
     and generates summaries using a Vision-Language Model.
     """
     video_path = Path(video_path)
-    output_dir = Path(output_dir)
+    output_dir = Path(output_dir) / datetime.now().strftime("%Y-%m-%d-%H-%M-%S")
     output_dir.mkdir(parents=True, exist_ok=True)
 
     # Normalize model name (remove provider prefix if present)
@@ -466,7 +630,56 @@ def create_chapters(video_path, transcript, output_dir, vlm_provider, vlm_model,
     default=360,
     help='Target chapter duration in seconds'
 )
-def process(video_path, output_dir, whisper_model, vlm_provider, vlm_model, api_key, language, chapter_duration):
+@click.option(
+    '--initial-prompt',
+    type=str,
+    default=None,
+    help='Initial prompt for Whisper (domain vocabulary, proper nouns, style hints)'
+)
+@click.option(
+    '--prompt-file',
+    type=click.Path(exists=True),
+    default=None,
+    help='Load initial prompt from a text file'
+)
+@click.option(
+    '--beam-size',
+    type=int,
+    default=5,
+    help='Beam search width (default: 5)'
+)
+@click.option(
+    '--compute-type',
+    type=click.Choice(['default', 'float16', 'int8_float16', 'int8', 'float32']),
+    default='default',
+    help='CTranslate2 compute type (default: auto-select)'
+)
+@click.option(
+    '--no-hallucination-filter',
+    is_flag=True,
+    help='Disable hallucination filtering'
+)
+@click.option(
+    '--vocab-file',
+    type=click.Path(exists=True),
+    default=None,
+    help='Vocabulary file with hotwords and known error examples for LLM correction'
+)
+@click.option(
+    '--max-segment-duration',
+    type=int,
+    default=10,
+    help='Max subtitle segment duration in seconds (default: 10)'
+)
+@click.option(
+    '--correction-model',
+    type=str,
+    default=None,
+    help='LLM model for vocab-based correction (e.g. gemini/gemini-2.0-flash, ollama/qwen3.5:27b, transformers/Qwen/Qwen3.5-27B). Requires --vocab-file'
+)
+def process(video_path, output_dir, whisper_model, vlm_provider, vlm_model, api_key, language, chapter_duration,
+            initial_prompt, prompt_file, beam_size, compute_type, no_hallucination_filter,
+            vocab_file, max_segment_duration, correction_model):
     """
     Full pipeline: transcribe video and create chapter summaries.
 
@@ -474,7 +687,7 @@ def process(video_path, output_dir, whisper_model, vlm_provider, vlm_model, api_
     in a single workflow.
     """
     video_path = Path(video_path)
-    output_dir = Path(output_dir)
+    output_dir = Path(output_dir) / datetime.now().strftime("%Y-%m-%d-%H-%M-%S")
     output_dir.mkdir(parents=True, exist_ok=True)
 
     # Normalize model name (remove provider prefix if present)
@@ -489,7 +702,15 @@ def process(video_path, output_dir, whisper_model, vlm_provider, vlm_model, api_
     click.echo(f"Video: {video_path}")
     click.echo(f"Output Directory: {output_dir}")
     click.echo(f"Whisper Model: {whisper_model}")
-    click.echo(f"VLM: {vlm_model_normalized}\n")
+    click.echo(f"VLM: {vlm_model_normalized}")
+
+    # Load prompt from file if specified
+    if prompt_file:
+        with open(prompt_file, 'r', encoding='utf-8') as f:
+            initial_prompt = f.read().strip()
+    if initial_prompt:
+        click.echo(f"Initial Prompt: {initial_prompt[:80]}{'...' if len(initial_prompt) > 80 else ''}")
+    click.echo()
 
     # PHASE 1: Transcription
     click.echo(f"\n{'#'*60}")
@@ -519,7 +740,17 @@ def process(video_path, output_dir, whisper_model, vlm_provider, vlm_model, api_
 
     # Transcribe
     click.echo("\nStep 3/4: Transcribing audio clips...")
-    transcriber = Transcriber(model_name=whisper_model)
+    transcriber = Transcriber(
+        model_name=whisper_model,
+        compute_type=compute_type,
+        beam_size=beam_size,
+        initial_prompt=initial_prompt,
+        hallucination_filter=not no_hallucination_filter,
+        vocab_file=vocab_file,
+        max_segment_duration=max_segment_duration,
+        correction_model=correction_model,
+        video_path=str(video_path),
+    )
 
     try:
         transcriptions = transcriber.transcribe_clips(clips, language=language)
